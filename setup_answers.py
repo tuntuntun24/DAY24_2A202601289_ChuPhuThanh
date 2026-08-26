@@ -16,6 +16,9 @@ import os
 import sys
 import time
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -39,7 +42,26 @@ def build_pipeline():
     from src.m2_search import HybridSearch
     from src.m3_rerank import CrossEncoderReranker
     from src.m5_enrichment import enrich_chunks
-    from config import RERANK_TOP_K
+    from config import COLLECTION_NAME, RERANK_TOP_K
+
+    # Reuse the persisted Qdrant collection after an interrupted setup run.
+    search = HybridSearch()
+    try:
+        if search.dense.client.collection_exists(COLLECTION_NAME):
+            points, _ = search.dense.client.scroll(
+                collection_name=COLLECTION_NAME, limit=1000, with_payload=True,
+            )
+            indexed_chunks = [
+                {"text": point.payload["text"], "metadata": dict(point.payload or {})}
+                for point in points if point.payload and point.payload.get("text")
+            ]
+            if indexed_chunks:
+                search.bm25.index(indexed_chunks)
+                reranker = CrossEncoderReranker(model_name="lexical")
+                print(f"✓ Reusing {len(indexed_chunks)} indexed chunks from Qdrant")
+                return search, reranker, RERANK_TOP_K
+    except Exception as exc:
+        print(f"  ⚠️  Could not reuse Qdrant index ({exc}); rebuilding it.")
 
     print("\n[1/3] Chunking + enriching documents...")
     t0 = time.time()
@@ -62,13 +84,12 @@ def build_pipeline():
 
     print("\n[2/3] Indexing (BM25 + Dense)...")
     t0 = time.time()
-    search = HybridSearch()
     search.index(all_chunks)
     print(f"  ✓ Indexed {len(all_chunks)} chunks ({time.time()-t0:.1f}s)")
 
     print("\n[3/3] Loading reranker...")
     t0 = time.time()
-    reranker = CrossEncoderReranker()
+    reranker = CrossEncoderReranker(model_name="lexical")
     print(f"  ✓ Reranker ready ({time.time()-t0:.1f}s)")
 
     return search, reranker, RERANK_TOP_K
@@ -101,6 +122,44 @@ def run_query(q: str, search, reranker, top_k: int) -> tuple[str, list[str]]:
     return (contexts[0] if contexts else "Không tìm thấy thông tin."), contexts
 
 
+def run_queries(items: list[dict], search, reranker, top_k: int) -> list[tuple[str, list[str]]]:
+    """Batch retrieval once, then generate answers sequentially."""
+    from config import OPENAI_API_KEY
+    from openai import OpenAI
+
+    questions = [item["question"] for item in items]
+    retrieved_batches = search.search_batch(questions)
+    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    outputs = []
+    for index, (question, retrieved) in enumerate(zip(questions, retrieved_batches), 1):
+        documents = [
+            {"text": result.text, "score": result.score, "metadata": result.metadata}
+            for result in retrieved
+        ]
+        reranked = reranker.rerank(question, documents, top_k=top_k)
+        contexts = [result.text for result in reranked] if reranked else [r.text for r in retrieved[:3]]
+        if client and contexts:
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    temperature=0,
+                    messages=[
+                        {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có, nói 'Không tìm thấy thông tin.'."},
+                        {"role": "user", "content": f"Context:\n{'\n\n'.join(contexts)}\n\nCâu hỏi: {question}"},
+                    ],
+                )
+                answer = response.choices[0].message.content or "Không tìm thấy thông tin."
+            except Exception as exc:
+                print(f"  ⚠️  LLM generation failed for question {index}: {exc}")
+                answer = contexts[0] if contexts else "Không tìm thấy thông tin."
+        else:
+            answer = contexts[0] if contexts else "Không tìm thấy thông tin."
+        outputs.append((answer, contexts))
+        if index % 10 == 0:
+            print(f"  [{index}/{len(items)}] generated")
+    return outputs
+
+
 def main():
     print("=" * 60)
     print("LAB 24 SETUP — Generating answers for 50 questions")
@@ -124,8 +183,8 @@ def main():
     answers = []
     t_start = time.time()
 
-    for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker, top_k)
+    generated = run_queries(test_set, search, reranker, top_k)
+    for i, (item, (answer, contexts)) in enumerate(zip(test_set, generated)):
         answers.append({
             "id":           item["id"],
             "distribution": item["distribution"],
@@ -134,8 +193,6 @@ def main():
             "contexts":     contexts,
             "ground_truth": item["ground_truth"],
         })
-        if (i + 1) % 10 == 0:
-            print(f"  [{i+1}/{len(test_set)}] done ({time.time()-t_start:.0f}s elapsed)")
 
     with open("answers_50q.json", "w", encoding="utf-8") as f:
         json.dump(answers, f, ensure_ascii=False, indent=2)
